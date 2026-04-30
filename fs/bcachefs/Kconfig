@@ -30,6 +30,20 @@ config BCACHEFS_QUOTA
 	depends on BCACHEFS_FS
 	select QUOTACTL
 
+config BCACHEFS_ALLOW_SET_CTIME
+	bool "Allow userspace to explicitly set ctime via ioctl"
+	depends on BCACHEFS_FS
+	help
+	  Enable the ability to explicitly set the ctime (change time) on files
+	  and directories via BCHFS_IOC_SET_TIMESTAMPS.
+
+	  ctime normally reflects the last metadata change and is maintained
+	  exclusively by the kernel.  Allowing userspace to override it is
+	  useful for backup/restore and forensic tools, but may confuse
+	  applications that rely on ctime for incremental change detection.
+
+	  If unsure, say N.
+
 config BCACHEFS_DEBUG
 	bool "bcachefs debugging"
 	depends on BCACHEFS_FS

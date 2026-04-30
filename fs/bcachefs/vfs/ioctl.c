@@ -984,6 +984,156 @@ static long bch2_ioc_unpoison(struct bch_fs *c, struct file *file,
 	}));
 }
 
+/*
+ * BCHFS_IOC_SET_TIMESTAMPS: explicitly set inode timestamps (atime, mtime,
+ * btime, and optionally ctime).  This is intended for backup/restore tools,
+ * forensic applications, and migration scripts that need to restore exact
+ * file timestamps, including the birth time (btime/otime) which has no
+ * generic Linux API.
+ *
+ * Permission: caller must own the file (or have CAP_FOWNER), matching
+ * utimensat() semantics for setting arbitrary timestamps.
+ *
+ * Setting ctime is allowed but should be used with care -- ctime normally
+ * reflects the last metadata change and modifying it explicitly may confuse
+ * incremental backup or change-detection tools.
+ */
+static int bch2_ioc_set_timestamps(struct bch_fs *c,
+				   struct file *file,
+				   struct bch_inode_info *inode,
+				   struct bch_ioctl_set_timestamps __user *uarg)
+{
+	struct bch_ioctl_set_timestamps arg;
+	struct mnt_idmap *idmap = file_mnt_idmap(file);
+	struct bch_inode_info *target = inode;
+	struct inode *target_vfs = NULL;
+	int ret;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+
+	if (arg.pad)
+		return -EINVAL;
+
+	/* at least one timestamp flag must be set */
+	if (!(arg.flags & (BCH_SET_TIME_ATIME|BCH_SET_TIME_MTIME|
+			   BCH_SET_TIME_BTIME|BCH_SET_TIME_CTIME)))
+		return -EINVAL;
+
+	/* reject unknown flags */
+	if (arg.flags & ~(BCH_SET_TIME_ATIME|BCH_SET_TIME_MTIME|
+			  BCH_SET_TIME_BTIME|BCH_SET_TIME_CTIME))
+		return -EINVAL;
+
+	/* ctime is gated behind a config option */
+#ifndef CONFIG_BCACHEFS_ALLOW_SET_CTIME
+	if (arg.flags & BCH_SET_TIME_CTIME)
+		return -EOPNOTSUPP;
+#endif
+
+	/* validate nsec fields */
+	if ((arg.flags & BCH_SET_TIME_ATIME) && arg.atime_nsec >= NSEC_PER_SEC)
+		return -EINVAL;
+	if ((arg.flags & BCH_SET_TIME_MTIME) && arg.mtime_nsec >= NSEC_PER_SEC)
+		return -EINVAL;
+#ifdef CONFIG_BCACHEFS_ALLOW_SET_CTIME
+	if ((arg.flags & BCH_SET_TIME_CTIME) && arg.ctime_nsec >= NSEC_PER_SEC)
+		return -EINVAL;
+#endif
+	if ((arg.flags & BCH_SET_TIME_BTIME) && arg.btime_nsec >= NSEC_PER_SEC)
+		return -EINVAL;
+
+	/* Resolve target inode: fd-based or by inum in the same subvolume */
+	if (arg.ino && arg.ino != inode->v.i_ino) {
+		subvol_inum inum = {
+			.subvol = inode_inum(inode).subvol,
+			.inum   = arg.ino,
+		};
+
+		target_vfs = bch2_vfs_inode_get(c, inum, __func__);
+		if (IS_ERR(target_vfs))
+			return PTR_ERR(target_vfs);
+
+		target = to_bch_ei(target_vfs);
+	}
+
+	ret = mnt_want_write_file(file);
+	if (ret)
+		goto put_target;
+
+	if (!inode_owner_or_capable(idmap, &target->v)) {
+		ret = -EPERM;
+		goto drop_write;
+	}
+
+	unsigned fields = 0;
+
+	if (arg.flags & BCH_SET_TIME_ATIME)
+		fields |= ATTR_ATIME;
+	if (arg.flags & BCH_SET_TIME_MTIME)
+		fields |= ATTR_MTIME;
+#ifdef CONFIG_BCACHEFS_ALLOW_SET_CTIME
+	if (arg.flags & BCH_SET_TIME_CTIME)
+		fields |= ATTR_CTIME;
+#endif
+	/* btime (bi_otime) has no VFS ATTR flag; it is always propagated
+	 * by bch2_inode_update_after_write via ei_inode = *bi.
+	 */
+
+	guard(mutex)(&target->ei_update_lock);
+
+	CLASS(btree_trans, trans)(c);
+
+	ret = lockrestart_do(trans, ({
+		CLASS(btree_iter_uninit, inode_iter)(trans);
+		struct bch_inode_unpacked inode_u;
+
+		try(bch2_inode_peek(trans, &inode_iter, &inode_u,
+				    inode_inum(target), BTREE_ITER_intent));
+
+		if (arg.flags & BCH_SET_TIME_ATIME)
+			inode_u.bi_atime = timespec_to_bch2_time(c,
+				(struct timespec64) {
+					.tv_sec  = arg.atime_sec,
+					.tv_nsec = arg.atime_nsec,
+				});
+		if (arg.flags & BCH_SET_TIME_MTIME)
+			inode_u.bi_mtime = timespec_to_bch2_time(c,
+				(struct timespec64) {
+					.tv_sec  = arg.mtime_sec,
+					.tv_nsec = arg.mtime_nsec,
+				});
+#ifdef CONFIG_BCACHEFS_ALLOW_SET_CTIME
+		if (arg.flags & BCH_SET_TIME_CTIME)
+			inode_u.bi_ctime = timespec_to_bch2_time(c,
+				(struct timespec64) {
+					.tv_sec  = arg.ctime_sec,
+					.tv_nsec = arg.ctime_nsec,
+				});
+#endif
+		if (arg.flags & BCH_SET_TIME_BTIME)
+			inode_u.bi_otime = timespec_to_bch2_time(c,
+				(struct timespec64) {
+					.tv_sec  = arg.btime_sec,
+					.tv_nsec = arg.btime_nsec,
+				});
+
+		try(bch2_inode_write(trans, &inode_iter, &inode_u));
+		try(bch2_trans_commit(trans, NULL, NULL,
+				      BCH_TRANS_COMMIT_no_enospc));
+
+		bch2_inode_update_after_write(trans, target, &inode_u, fields);
+		0;
+	}));
+drop_write:
+	mnt_drop_write_file(file);
+put_target:
+	if (target_vfs)
+		iput(target_vfs);
+
+	return ret;
+}
+
 long bch2_fs_file_ioctl(struct file *file, unsigned cmd, unsigned long arg)
 {
 	struct bch_inode_info *inode = file_bch_inode(file);
@@ -1083,6 +1233,11 @@ long bch2_fs_file_ioctl(struct file *file, unsigned cmd, unsigned long arg)
 	case BCHFS_IOC_UNPOISON:
 		ret = bch2_ioc_unpoison(c, file, inode,
 				(struct bch_ioctl_unpoison __user *) arg);
+		break;
+
+	case BCHFS_IOC_SET_TIMESTAMPS:
+		ret = bch2_ioc_set_timestamps(c, file, inode,
+				(struct bch_ioctl_set_timestamps __user *) arg);
 		break;
 
 	default:

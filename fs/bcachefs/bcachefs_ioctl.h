@@ -81,6 +81,7 @@
 #define BCHFS_IOC_PROPAGATE_REFLINK_P_OPTS	_IO(0xbc, 66)
 #define BCHFS_IOC_PREAD_RAW		_IOWR(0xbc, 67, struct bch_ioctl_pread_raw)
 #define BCHFS_IOC_UNPOISON		_IOW(0xbc, 68, struct bch_ioctl_unpoison)
+#define BCHFS_IOC_SET_TIMESTAMPS	_IOW(0xbc, 69, struct bch_ioctl_set_timestamps)
 
 struct bch_ioctl_err_msg {
 	__u64			msg_ptr;
@@ -637,5 +638,47 @@ struct bch_ioctl_unpoison {
 	__u32				flags;		/* reserved, must be 0 */
 	__u32				pad;
 };
+
+/*
+ * BCHFS_IOC_SET_TIMESTAMPS: explicitly set inode timestamps.
+ *
+ * This ioctl allows userspace to set atime, mtime, btime (birth/creation time),
+ * and optionally ctime on a file or directory.  Since Linux has no generic API
+ * for setting btime and ctime is normally kernel-only, this provides the
+ * missing functionality for backup/restore tools, forensic applications, and
+ * migration scripts.
+ *
+ * Permission checks follow utimensat(): the caller must be the file owner
+ * (or have CAP_FOWNER) to set arbitrary timestamps.
+ *
+ * Setting ctime is allowed but should be used with care -- ctime is intended
+ * to reflect the last metadata change and setting it explicitly may confuse
+ * applications that rely on it for incremental backups or change detection.
+ *
+ * @ino:       inode number; 0 means use the file descriptor's inode.
+ *             Nonzero means look up the given inum in the same subvolume as
+ *             the fd.  The caller must have write access via the fd's
+ *             subvolume.
+ * @flags:     bitmask of BCH_SET_TIME_* flags indicating which timestamps
+ *             to set.  At least one flag must be provided.
+ */
+struct bch_ioctl_set_timestamps {
+	__u64			ino;
+	__u64			atime_sec;
+	__u64			atime_nsec;
+	__u64			mtime_sec;
+	__u64			mtime_nsec;
+	__u64			ctime_sec;
+	__u64			ctime_nsec;
+	__u64			btime_sec;
+	__u64			btime_nsec;
+	__u32			flags;
+	__u32			pad;
+};
+
+#define BCH_SET_TIME_ATIME	(1U << 0)
+#define BCH_SET_TIME_MTIME	(1U << 1)
+#define BCH_SET_TIME_CTIME	(1U << 2)
+#define BCH_SET_TIME_BTIME	(1U << 3)
 
 #endif /* _BCACHEFS_IOCTL_H */
